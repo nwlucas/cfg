@@ -3,7 +3,11 @@
 package cfg
 
 import (
+    "bytes"
     "fmt"
+    "io"
+    "io/ioutil"
+    "path/filepath"
     "reflect"
     "strings"
     "time"
@@ -32,9 +36,10 @@ type Config struct {
     // List of to search for files
     configPaths []string
 
-    config   map[string]interface{}
-    defaults map[string]interface{}
-    aliases  map[string]string
+    config    map[string]interface{}
+    defaults  map[string]interface{}
+    overrides map[string]interface{}
+    aliases   map[string]string
 
     typeByDefValue bool
 }
@@ -58,7 +63,7 @@ func (fnfe ConfigFileNotFoundError) Error() string {
 }
 
 // Universally supported extensions.
-var SupportedExts []string = []string{"json", "toml", "yaml", "yml", "properties", "props", "prop"}
+var SupportedExts []string = []string{"toml", "yaml", "yml"}
 
 // Returns a properly initialized Config instance
 func New() *Config {
@@ -67,10 +72,17 @@ func New() *Config {
     c.configName = "config"
     c.config = make(map[string]interface{})
     c.defaults = make(map[string]interface{})
+    c.overrides = make(map[string]interface{})
     c.aliases = make(map[string]string)
     c.typeByDefValue = false
 
     return c
+}
+
+func Reset() {
+    c = New()
+
+    SupportedExts = []string{"toml", "yaml", "yml"}
 }
 
 // Explicitly sets the config file to be used.
@@ -79,6 +91,79 @@ func (c *Config) SetConfigFile(s string) {
     if s != "" {
         c.configFile = s
     }
+}
+
+// Explicitly sets the config name to be used.
+func SetConfigName(s string) { c.SetConfigName(s) }
+func (c *Config) SetConfigName(s string) {
+    if s != "" {
+        c.configName = s
+    }
+}
+
+// Explicitly sets the config file to be used.
+func SetConfigType(s string) { c.SetConfigType(s) }
+func (c *Config) SetConfigType(s string) {
+    if s != "" {
+        c.configType = s
+    }
+}
+
+func (c *Config) getConfigType() string {
+    if c.configType != "" {
+        return c.configType
+    }
+
+    cf := c.getConfigFile()
+    ext := filepath.Ext(cf)
+
+    if len(ext) > 1 {
+        return ext[1:]
+    } else {
+        return ""
+    }
+}
+
+func (c *Config) getConfigFile() string {
+    if c.configFile != "" {
+        return c.configFile
+    }
+
+    cf, err := c.findConfigFile()
+    if err != nil {
+        return ""
+    }
+
+    c.configFile = cf
+    return c.getConfigFile()
+}
+
+func (c *Config) searchInPath(in string) (filename string) {
+    jww.DEBUG.Println("Searching for config in ", in)
+    for _, ext := range SupportedExts {
+        jww.DEBUG.Println("Checking for", filepath.Join(in, c.configName+"."+ext))
+        if b, _ := exists(filepath.Join(in, c.configName+"."+ext)); b {
+            jww.DEBUG.Println("Found: ", filepath.Join(in, c.configName+"."+ext))
+            return filepath.Join(in, c.configName+"."+ext)
+        }
+    }
+
+    return ""
+}
+
+// search all configPaths for any config file.
+// Returns the first path that exists (and is a config file)
+func (c *Config) findConfigFile() (string, error) {
+
+    jww.INFO.Println("Searching for config in ", c.configPaths)
+
+    for _, cp := range c.configPaths {
+        file := c.searchInPath(cp)
+        if file != "" {
+            return file, nil
+        }
+    }
+    return "", ConfigFileNotFoundError{c.configName, fmt.Sprintf("%s", c.configPaths)}
 }
 
 // Return the file used to populate the config.
@@ -120,7 +205,7 @@ func (c *Config) searchMap(s map[string]interface{}, p []string) interface{} {
     }
 }
 
-func Get(key string) interface{} { c.Get(key) }
+func Get(key string) interface{} { return c.Get(key) }
 func (c *Config) Get(key string) interface{} {
     p := strings.Split(key, c.keyDelm)
 
@@ -245,6 +330,196 @@ func UnmarshalKey(key string, rawVal interface{}) error {
 }
 func (c *Config) UnmarshalKey(key string, rawVal interface{}) error {
     return mapstructure.Decode(c.Get(key), rawVal)
+}
+
+func Unmarshal(rawVal interface{}) error {
+    return c.Unmarshal(rawVal)
+}
+func (c *Config) Unmarshal(rawVal interface{}) error {
+    err := mapstructure.WeakDecode(c.AllSettings(), rawVal)
+
+    if err != nil {
+        return err
+    }
+
+    c.insensitiviseMaps()
+
+    return nil
+}
+
+func (c *Config) find(key string) interface{} {
+    var val interface{}
+    var exists bool
+
+    key = c.realKey(key)
+
+    val, exists = c.overrides[key]
+    if exists {
+        jww.TRACE.Println(key, "found in overrides: ", val)
+        return val
+    }
+
+    val, exists = c.config[key]
+    if exists {
+        jww.TRACE.Println(key, "found in config: ", val)
+        return val
+    }
+
+    if strings.Contains(key, c.keyDelm) {
+        path := strings.Split(key, c.keyDelm)
+
+        source := c.find(path[0])
+        if source != nil {
+            if reflect.TypeOf(source).Kind() == reflect.Map {
+                val := c.searchMap(cast.ToStringMap(source), path[1:])
+                jww.TRACE.Println(key, "Found in nested config: ", val)
+                return val
+            }
+        }
+    }
+
+    val, exists = c.defaults[key]
+    if exists {
+        jww.TRACE.Println(key, "found in defaults: ", val)
+        return val
+    }
+
+    return nil
+}
+
+// Aliases provide another accessor for the same key.
+// This enables one to change a name without breaking the application
+func RegisterAlias(alias string, key string) { c.RegisterAlias(alias, key) }
+func (c *Config) RegisterAlias(alias string, key string) {
+    c.registerAlias(alias, strings.ToLower(key))
+}
+
+func (c *Config) registerAlias(alias string, key string) {
+    alias = strings.ToLower(alias)
+    if alias != key && alias != c.realKey(key) {
+        _, exists := c.aliases[alias]
+
+        if !exists {
+            // if we alias something that exists in one of the maps to another
+            // name, we'll never be able to get that value using the original
+            // name, so move the config value to the new realkey.
+            if val, ok := c.config[alias]; ok {
+                delete(c.config, alias)
+                c.config[key] = val
+            }
+            if val, ok := c.defaults[alias]; ok {
+                delete(c.defaults, alias)
+                c.defaults[key] = val
+            }
+            if val, ok := c.overrides[alias]; ok {
+                delete(c.overrides, alias)
+                c.overrides[key] = val
+            }
+            c.aliases[alias] = key
+        }
+    } else {
+        jww.WARN.Println("Creating circular reference alias", alias, key, c.realKey(key))
+    }
+}
+
+func IsSet(key string) bool { return c.IsSet(key) }
+func (c *Config) IsSet(key string) bool {
+    t := c.Get(key)
+    return t != nil
+}
+
+func (c *Config) realKey(key string) string {
+    newkey, exists := c.aliases[key]
+    if exists {
+        jww.DEBUG.Println("Alias", key, "to", newkey)
+        return c.realKey(newkey)
+    } else {
+        return key
+    }
+}
+
+func InConfig(key string) bool { return c.InConfig(key) }
+func (c *Config) InConfig(key string) bool {
+    key = c.realKey(key)
+
+    _, exists := c.config[key]
+    return exists
+}
+
+func SetDefault(key string, value interface{}) { c.SetDefault(key, value) }
+func (c *Config) SetDefault(key string, value interface{}) {
+    key = c.realKey(strings.ToLower(key))
+    c.defaults[key] = value
+}
+
+func Set(key string, value interface{}) { c.Set(key, value) }
+func (c *Config) Set(key string, value interface{}) {
+    key = c.realKey(strings.ToLower(key))
+    c.overrides[key] = value
+}
+
+func ReadInConfig() error { return c.ReadInConfig() }
+func (c *Config) ReadInConfig() error {
+    jww.INFO.Println("Attempting to read in config file")
+    if !stringInSlice(c.getConfigType(), SupportedExts) {
+        return UnsupportedConfigError(c.getConfigType())
+    }
+
+    file, err := ioutil.ReadFile(c.getConfigFile())
+    if err != nil {
+        return err
+    }
+
+    c.config = make(map[string]interface{})
+
+    return c.unmarshalReader(bytes.NewReader(file), c.config)
+}
+
+func unmarshalReader(in io.Reader, v map[string]interface{}) error {
+    return c.unmarshalReader(in, v)
+}
+func (c *Config) unmarshalReader(in io.Reader, v map[string]interface{}) error {
+    return unmarshallConfigReader(in, v, c.getConfigType())
+}
+
+func (c *Config) insensitiviseMaps() {
+    insensitiviseMap(c.config)
+    insensitiviseMap(c.defaults)
+    insensitiviseMap(c.overrides)
+}
+
+func AllKeys() []string { return c.AllKeys() }
+func (c *Config) AllKeys() []string {
+    m := map[string]struct{}{}
+
+    for key := range c.defaults {
+        m[key] = struct{}{}
+    }
+
+    for key := range c.config {
+        m[key] = struct{}{}
+    }
+
+    for key := range c.overrides {
+        m[key] = struct{}{}
+    }
+
+    a := []string{}
+    for x := range m {
+        a = append(a, x)
+    }
+
+    return a
+}
+
+func AllSettings() map[string]interface{} { return c.AllSettings() }
+func (c *Config) AllSettings() map[string]interface{} {
+    m := map[string]interface{}{}
+    for _, x := range c.AllKeys() {
+        m[x] = c.Get(x)
+    }
+
+    return m
 }
 
 // Prints all configuration registries for debugging

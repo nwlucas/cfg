@@ -13,6 +13,7 @@ import (
     "gopkg.in/yaml.v2"
 
     "github.com/BurntSushi/toml"
+    "github.com/spf13/cast"
     jww "github.com/spf13/jwalterweatherman"
 )
 
