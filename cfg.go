@@ -1,4 +1,4 @@
-// This packages sole purpose is to parse some config file (defaults to Go program calling it basename.)
+// Package cfg atetempts to parse some config file (defaults to Go program calling it basename.)
 // Ideally should be abstracted out more to parse any YAML, TOML based config file and return the struct.
 package cfg
 
