@@ -22,6 +22,7 @@ var c *Config
 
 func init() {
     c = New()
+    jww.UseTempLogFile("cfg")
 }
 
 type Config struct {
@@ -41,7 +42,28 @@ type Config struct {
     overrides map[string]interface{}
     aliases   map[string]string
 
+    verbose        bool
     typeByDefValue bool
+}
+
+// Sets log file to the passed in paramter. Currently assumes the file is writable.
+func SetLogFile(s string) { c.SetLogFile(s) }
+func (c *Config) SetLogFile(s string) {
+    if c.verbose {
+        jww.SetLogThreshold(jww.LevelTrace)
+        jww.SetStdoutThreshold(jww.LevelInfo)
+    }
+    jww.SetLogFile(s)
+}
+
+func SetVerbosity(v bool) { c.SetVerbosity(v) }
+func (c *Config) SetVerbosity(v bool) {
+    if v != true && v != false {
+        jww.ERROR.Println("Incorrect value for verbosity provided.")
+        c.verbose = false
+    } else {
+        c.verbose = v
+    }
 }
 
 // Denotes finding an unsurpported config
@@ -75,6 +97,7 @@ func New() *Config {
     c.overrides = make(map[string]interface{})
     c.aliases = make(map[string]string)
     c.typeByDefValue = false
+    c.verbose = false
 
     return c
 }
