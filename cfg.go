@@ -46,12 +46,15 @@ type Config struct {
     typeByDefValue bool
 }
 
-// Sets log file to the passed in paramter. Currently assumes the file is writable.
+// Sets log file to the passed in parameter. Currently assumes the file is writable.
 func SetLogFile(s string) { c.SetLogFile(s) }
 func (c *Config) SetLogFile(s string) {
     if c.verbose {
-        jww.SetLogThreshold(jww.LevelTrace)
+        jww.SetLogThreshold(jww.LevelDebug)
         jww.SetStdoutThreshold(jww.LevelInfo)
+    } else {
+        jww.SetLogThreshold(jww.LevelWarn)
+        jww.SetStdoutThreshold(jww.LevelError)
     }
     jww.SetLogFile(s)
 }
